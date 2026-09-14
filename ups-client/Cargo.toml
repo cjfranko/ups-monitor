@@ -19,3 +19,6 @@ tray-icon = "0.19"
 eframe = "0.29"
 egui = "0.29"
 material-icons = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
