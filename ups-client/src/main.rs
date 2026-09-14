@@ -1,3 +1,4 @@
+mod aumid;
 mod config;
 mod detect;
 mod gui;
@@ -18,6 +19,7 @@ fn main() -> Result<()> {
         .init();
 
     notify::init_app_id();
+    aumid::ensure_registered();
 
     let cfg = config::Config::load()?;
     info!(server = ?cfg.base_url(), "starting ups-client");

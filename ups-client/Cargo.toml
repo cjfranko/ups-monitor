@@ -19,6 +19,21 @@ tray-icon = "0.19"
 eframe = "0.29"
 egui = "0.29"
 material-icons = "0.3"
+# Decodes assets/icon.ico (if present) into raw RGBA for the window/taskbar icon.
+image = { version = "0.25", default-features = false, features = ["ico"] }
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Storage_EnhancedStorage",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds assets/icon.ico (if present) as the .exe's own icon.
+winres = "0.1"

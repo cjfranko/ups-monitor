@@ -10,9 +10,23 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use ups_common::PowerState;
 
+use crate::aumid;
 use crate::config::Config;
 use crate::poller::PollerControl;
 use crate::state::{self, Connectivity, SharedClientState};
+
+/// Loads `assets/icon.ico` (see `aumid::icon_path`) as the window/taskbar
+/// icon, if it's been designed yet.
+fn load_window_icon() -> Option<egui::IconData> {
+    let path = aumid::icon_path()?;
+    let img = image::open(&path).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
 
 const FONT_NAME: &str = "material_icons";
 const ARIAL_NAME: &str = "arial";
@@ -433,11 +447,15 @@ impl eframe::App for ClientApp {
 }
 
 pub fn run(ctx: GuiContext) -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("UPS Monitor — Client")
+        .with_inner_size([420.0, 520.0])
+        .with_visible(true);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UPS Monitor — Client")
-            .with_inner_size([420.0, 520.0])
-            .with_visible(true),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

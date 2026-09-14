@@ -20,6 +20,38 @@ use crate::state::{self, SharedState};
 const FONT_NAME: &str = "material_icons";
 const ARIAL_NAME: &str = "arial";
 
+/// If present, this is the app's window/exe icon (see `assets/README.md`).
+/// Checked next to the running executable first (the deployed layout), then
+/// falling back to the crate's own `assets/` folder so `cargo run` picks it
+/// up in dev without a copy step.
+fn icon_path() -> Option<std::path::PathBuf> {
+    let deployed = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("assets").join("icon.ico")));
+    if let Some(p) = deployed {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icon.ico");
+    dev.exists().then_some(dev)
+}
+
+/// Loads `assets/icon.ico` as the window/taskbar icon, if it's been designed
+/// yet.
+fn load_window_icon() -> Option<egui::IconData> {
+    let path = icon_path()?;
+    let img = image::open(&path).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 /// Everything the GUI needs to manage UPS units live, not just display them.
 pub struct GuiContext {
     pub state: SharedState,
@@ -667,11 +699,15 @@ impl eframe::App for StatusApp {
 }
 
 pub fn run(ctx: GuiContext) -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("UPS Monitor — Server")
+        .with_inner_size([420.0, 500.0])
+        .with_visible(true);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UPS Monitor — Server")
-            .with_inner_size([420.0, 500.0])
-            .with_visible(true),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

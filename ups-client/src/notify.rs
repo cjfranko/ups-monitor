@@ -14,10 +14,9 @@
 
 use crate::detect::AlertEvent;
 
-/// AppUserModelID for taskbar/tray identity. Toasts themselves are shown
-/// under the PowerShell AUMID instead (see `imp::base`) since a custom AUMID
-/// needs a registered Start Menu shortcut before Windows will render toasts
-/// for it — this one only affects taskbar grouping for this process.
+/// AppUserModelID for taskbar/tray identity (process-wide grouping only —
+/// see `crate::aumid` for the toast-identity registration, which is a
+/// separate mechanism).
 pub const APP_ID: &str = "UpsMonitor.Client";
 
 pub fn init_app_id() {
@@ -57,7 +56,8 @@ pub fn fire_server_recovered() {
 #[cfg(windows)]
 mod imp {
     use super::AlertEvent;
-    use tauri_winrt_notification::{LoopableSound, Result, Scenario, Sound, Toast};
+    use crate::aumid;
+    use tauri_winrt_notification::{IconCrop, LoopableSound, Result, Scenario, Sound, Toast};
     use tracing::{info, warn};
 
     fn report(tag: &str, res: Result<()>) {
@@ -68,13 +68,23 @@ mod imp {
     }
 
     fn base() -> Toast {
-        // A custom AppUserModelID (see `super::init_app_id`) needs a
-        // registered Start Menu shortcut before Windows will actually render
-        // toasts for it — otherwise `show()` returns Ok but nothing appears
-        // on screen. Using the well-known PowerShell AUMID sidesteps that:
-        // it's always registered, so toasts show reliably (labelled as from
-        // "Windows PowerShell") without installing this app.
-        Toast::new(Toast::POWERSHELL_APP_ID)
+        // Send under our own AUMID once `aumid::ensure_registered` has set
+        // up a Start Menu shortcut for it — Windows shows the shortcut's
+        // name ("UPS Monitor Client") as the toast sender. If registration
+        // failed this run, fall back to the well-known PowerShell AUMID
+        // (always registered) rather than lose toasts silently: sending
+        // under an *unregistered* custom AUMID makes `show()` report success
+        // while nothing ever appears on screen.
+        let app_id = if aumid::is_registered() {
+            aumid::APP_ID
+        } else {
+            Toast::POWERSHELL_APP_ID
+        };
+        let mut toast = Toast::new(app_id);
+        if let Some(icon) = aumid::icon_path() {
+            toast = toast.icon(&icon, IconCrop::Square, "UPS Monitor");
+        }
+        toast
     }
 
     pub fn fire(event: &AlertEvent) {
