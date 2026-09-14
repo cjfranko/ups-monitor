@@ -1,9 +1,12 @@
-Drop the server's application icon here as `icon.ico` (ideally multi-resolution:
-16, 32, 48, 256px). Once present it's automatically used for:
+This app's icon assets. All are compiled directly into the exe (via
+`include_bytes!` in `gui.rs`, and via `build.rs` for `icon.ico`), so nothing
+extra needs to ship alongside the binary — but that also means **a full
+rebuild is required** after replacing any of these files.
 
-- the compiled .exe's own icon (File Explorer, taskbar, Alt-Tab, shortcuts) —
-  embedded at build time by `build.rs`
-- the app window's icon while running — loaded at startup by `gui.rs`
-
-Nothing needs to change in the code; both just check for this file and no-op
-if it isn't there yet. Re-run `cargo build` after adding/replacing it.
+- `icon.png` — the app icon: window/taskbar icon while running
+- `icon.ico` — the same icon as a real multi-resolution `.ico`, needed
+  because embedding an exe resource icon requires that format specifically;
+  regenerate it from `icon.png` if you change the art (16/32/48/256px)
+- `tray-green.png` / `tray-orange.png` / `tray-red.png` — the system tray
+  icon for each health state (all online / a UPS on battery / a UPS
+  unreachable), resized to 32×32 at startup
