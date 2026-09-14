@@ -1,0 +1,26 @@
+[server]
+# The machine-room PC's LAN address. Use the box's real IP rather than
+# 0.0.0.0 if you only want to serve on one interface.
+bind_ip = "0.0.0.0"
+port = 8420
+
+# One entry per UPS. `id` is what clients display and alert on; `serial` is
+# the USB serial used to match the physical unit. Run the server once without
+# mock mode and check the log for discovered serials, then fill these in.
+# In --mock mode the serials are ignored.
+
+[[ups]]
+id = "rack1-a"
+serial = "AS0000000001"
+
+[[ups]]
+id = "rack1-b"
+serial = "AS0000000002"
+
+[[ups]]
+id = "rack2-a"
+serial = "AS0000000003"
+
+[[ups]]
+id = "rack2-b"
+serial = "AS0000000004"

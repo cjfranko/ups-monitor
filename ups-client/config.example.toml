@@ -1,0 +1,15 @@
+[server]
+# Address of the ups-server (the machine-room PC).
+address = "192.168.1.50"
+port = 8420
+
+[polling]
+interval_secs = 5
+# Consecutive failed polls before the client declares the server unreachable
+# and toasts about it.
+unreachable_after_missed = 2
+
+[alerts]
+# Battery percentage (while on battery) below which the Tier 2 "SHUT DOWN NOW"
+# alert fires.
+low_battery_threshold_pct = 20
