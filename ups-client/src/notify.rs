@@ -81,7 +81,7 @@ mod imp {
             Toast::POWERSHELL_APP_ID
         };
         let mut toast = Toast::new(app_id);
-        if let Some(icon) = aumid::icon_path() {
+        if let Some(icon) = aumid::toast_icon_path() {
             toast = toast.icon(&icon, IconCrop::Square, "UPS Monitor");
         }
         toast

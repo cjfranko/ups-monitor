@@ -20,30 +20,12 @@ use crate::state::{self, SharedState};
 const FONT_NAME: &str = "material_icons";
 const ARIAL_NAME: &str = "arial";
 
-/// If present, this is the app's window/exe icon (see `assets/README.md`).
-/// Checked next to the running executable first (the deployed layout), then
-/// falling back to the crate's own `assets/` folder so `cargo run` picks it
-/// up in dev without a copy step.
-fn icon_path() -> Option<std::path::PathBuf> {
-    let deployed = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("assets").join("icon.ico")));
-    if let Some(p) = deployed {
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join("icon.ico");
-    dev.exists().then_some(dev)
-}
+/// The app icon, embedded in the exe so there's nothing extra to deploy.
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
-/// Loads `assets/icon.ico` as the window/taskbar icon, if it's been designed
-/// yet.
+/// The window/taskbar icon, decoded from the embedded app icon.
 fn load_window_icon() -> Option<egui::IconData> {
-    let path = icon_path()?;
-    let img = image::open(&path).ok()?.into_rgba8();
+    let img = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
     let (width, height) = img.dimensions();
     Some(egui::IconData {
         rgba: img.into_raw(),
@@ -118,19 +100,41 @@ fn overall_health(statuses: &[ups_common::UpsStatus]) -> Health {
     }
 }
 
-fn solid_icon(rgba: [u8; 4]) -> tray_icon::Icon {
-    let mut data = Vec::with_capacity(32 * 32 * 4);
-    for _ in 0..32 * 32 {
-        data.extend_from_slice(&rgba);
-    }
-    tray_icon::Icon::from_rgba(data, 32, 32).expect("valid icon")
+const TRAY_GREEN: &[u8] = include_bytes!("../assets/tray-green.png");
+const TRAY_ORANGE: &[u8] = include_bytes!("../assets/tray-orange.png");
+const TRAY_RED: &[u8] = include_bytes!("../assets/tray-red.png");
+const TRAY_ICON_SIZE: u32 = 32;
+
+fn decode_tray_icon(bytes: &[u8]) -> tray_icon::Icon {
+    let img = image::load_from_memory(bytes)
+        .expect("bundled tray icon should decode")
+        .resize_exact(TRAY_ICON_SIZE, TRAY_ICON_SIZE, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    tray_icon::Icon::from_rgba(img.into_raw(), TRAY_ICON_SIZE, TRAY_ICON_SIZE).expect("valid icon")
 }
 
-fn health_icon(h: &Health) -> tray_icon::Icon {
-    match h {
-        Health::AllOnline => solid_icon([0x2e, 0x7d, 0x32, 0xff]),
-        Health::AnyOnBattery => solid_icon([0xf9, 0xa8, 0x25, 0xff]),
-        Health::AnyUnknown => solid_icon([0xc6, 0x28, 0x28, 0xff]),
+/// The three health-state tray icons, decoded once at startup.
+struct TrayIcons {
+    all_online: tray_icon::Icon,
+    any_on_battery: tray_icon::Icon,
+    any_unknown: tray_icon::Icon,
+}
+
+impl TrayIcons {
+    fn load() -> Self {
+        Self {
+            all_online: decode_tray_icon(TRAY_GREEN),
+            any_on_battery: decode_tray_icon(TRAY_ORANGE),
+            any_unknown: decode_tray_icon(TRAY_RED),
+        }
+    }
+
+    fn for_health(&self, h: &Health) -> tray_icon::Icon {
+        match h {
+            Health::AllOnline => self.all_online.clone(),
+            Health::AnyOnBattery => self.any_on_battery.clone(),
+            Health::AnyUnknown => self.any_unknown.clone(),
+        }
     }
 }
 
@@ -162,6 +166,7 @@ pub struct StatusApp {
     config: Arc<Mutex<Config>>,
     mock_mode: bool,
     tray: tray_icon::TrayIcon,
+    tray_icons: TrayIcons,
     _menu: Menu,
     rx: Receiver<GuiCmd>,
     visible: bool,
@@ -175,6 +180,7 @@ impl StatusApp {
     pub fn new(cc: &eframe::CreationContext<'_>, ctx: GuiContext) -> Self {
         install_material_font(&cc.egui_ctx);
 
+        let tray_icons = TrayIcons::load();
         let (tx, rx) = mpsc::channel::<GuiCmd>();
 
         let menu = Menu::new();
@@ -186,7 +192,7 @@ impl StatusApp {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
             .with_tooltip("UPS Monitor — server")
-            .with_icon(health_icon(&Health::AllOnline))
+            .with_icon(tray_icons.for_health(&Health::AllOnline))
             .build()
             .expect("failed to create tray icon");
 
@@ -224,6 +230,7 @@ impl StatusApp {
             config: ctx.config,
             mock_mode: ctx.mock_mode,
             tray,
+            tray_icons,
             _menu: menu,
             rx,
             // Start visible so the user immediately sees UPS status; closing
@@ -492,7 +499,7 @@ impl eframe::App for StatusApp {
 
         let statuses = state::snapshot(&self.state);
         let health = overall_health(&statuses);
-        let _ = self.tray.set_icon(Some(health_icon(&health)));
+        let _ = self.tray.set_icon(Some(self.tray_icons.for_health(&health)));
         let tooltip = match health {
             Health::AllOnline => "UPS Monitor — all online".to_string(),
             Health::AnyOnBattery => "UPS Monitor — a UPS is on battery".to_string(),

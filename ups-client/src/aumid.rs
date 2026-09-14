@@ -50,29 +50,45 @@ pub fn is_registered() -> bool {
     REGISTERED.load(Ordering::Relaxed)
 }
 
-/// If present, this is used as the shortcut's icon and (via `notify.rs`)
-/// the toast's icon override. Checked next to the running executable first
-/// (the deployed layout — ship the `assets` folder alongside the .exe), then
-/// falling back to the crate's own `assets/` folder so `cargo run` picks it
-/// up in dev without a copy step.
-pub fn icon_path() -> Option<PathBuf> {
-    let deployed = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("assets").join("icon.ico")));
-    if let Some(p) = deployed {
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join("icon.ico");
-    dev.exists().then_some(dev)
+/// The app icon, embedded in the exe so there's nothing extra to deploy.
+/// `gui.rs` decodes these bytes directly for the window/taskbar icon; the
+/// toast icon and the AUMID shortcut's icon (below) need an actual file on
+/// disk instead (WinRT toast XML and `IShellLinkW::SetIconLocation` both
+/// take a path, not bytes), so those write this out to a per-user cache dir
+/// once at startup.
+pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+const ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
+
+fn cache_dir() -> Option<PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    Some(PathBuf::from(base).join("UpsMonitorClient"))
+}
+
+/// Writes `bytes` to `<cache_dir>/<name>`, overwriting any existing file
+/// (cheap — a few KB, once per process start), and returns the path.
+fn write_cached(name: &str, bytes: &[u8]) -> Option<PathBuf> {
+    let dir = cache_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+/// The app icon as a real file, for the toast icon override in `notify.rs`.
+pub fn toast_icon_path() -> Option<PathBuf> {
+    write_cached("icon.png", ICON_PNG)
+}
+
+/// The app icon as a real .ico file — Explorer shell shortcuts (unlike
+/// toasts or egui) only accept `.ico`/`.exe`/`.dll` as an icon source, so the
+/// Start Menu shortcut registered for AUMID purposes needs this specifically.
+fn shortcut_icon_path() -> Option<PathBuf> {
+    write_cached("icon.ico", ICON_ICO)
 }
 
 #[cfg(windows)]
 mod imp {
-    use super::{icon_path, APP_ID, DISPLAY_NAME};
+    use super::{shortcut_icon_path, APP_ID, DISPLAY_NAME};
     use anyhow::{Context, Result};
     use windows::core::{Interface, PCWSTR, PWSTR};
     use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
@@ -146,7 +162,7 @@ mod imp {
             if let Some(dir) = exe.parent() {
                 let _ = shell_link.SetWorkingDirectory(PCWSTR(wide(&dir.to_string_lossy()).as_ptr()));
             }
-            if let Some(icon) = icon_path() {
+            if let Some(icon) = shortcut_icon_path() {
                 let _ = shell_link
                     .SetIconLocation(PCWSTR(wide(&icon.to_string_lossy()).as_ptr()), 0);
             }

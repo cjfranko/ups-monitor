@@ -15,17 +15,54 @@ use crate::config::Config;
 use crate::poller::PollerControl;
 use crate::state::{self, Connectivity, SharedClientState};
 
-/// Loads `assets/icon.ico` (see `aumid::icon_path`) as the window/taskbar
-/// icon, if it's been designed yet.
+/// The window/taskbar icon, decoded from the same bytes embedded for the
+/// toast icon (see `aumid::ICON_PNG`).
 fn load_window_icon() -> Option<egui::IconData> {
-    let path = aumid::icon_path()?;
-    let img = image::open(&path).ok()?.into_rgba8();
+    let img = image::load_from_memory(aumid::ICON_PNG).ok()?.into_rgba8();
     let (width, height) = img.dimensions();
     Some(egui::IconData {
         rgba: img.into_raw(),
         width,
         height,
     })
+}
+
+const TRAY_GREEN: &[u8] = include_bytes!("../assets/tray-green.png");
+const TRAY_ORANGE: &[u8] = include_bytes!("../assets/tray-orange.png");
+const TRAY_RED: &[u8] = include_bytes!("../assets/tray-red.png");
+const TRAY_ICON_SIZE: u32 = 32;
+
+fn decode_tray_icon(bytes: &[u8]) -> tray_icon::Icon {
+    let img = image::load_from_memory(bytes)
+        .expect("bundled tray icon should decode")
+        .resize_exact(TRAY_ICON_SIZE, TRAY_ICON_SIZE, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    tray_icon::Icon::from_rgba(img.into_raw(), TRAY_ICON_SIZE, TRAY_ICON_SIZE).expect("valid icon")
+}
+
+/// The three health-state tray icons, decoded once at startup.
+struct TrayIcons {
+    ok: tray_icon::Icon,
+    on_battery: tray_icon::Icon,
+    unreachable: tray_icon::Icon,
+}
+
+impl TrayIcons {
+    fn load() -> Self {
+        Self {
+            ok: decode_tray_icon(TRAY_GREEN),
+            on_battery: decode_tray_icon(TRAY_ORANGE),
+            unreachable: decode_tray_icon(TRAY_RED),
+        }
+    }
+
+    fn for_state(&self, t: &TrayState) -> tray_icon::Icon {
+        match t {
+            TrayState::Ok => self.ok.clone(),
+            TrayState::OnBattery => self.on_battery.clone(),
+            TrayState::Unreachable => self.unreachable.clone(),
+        }
+    }
 }
 
 const FONT_NAME: &str = "material_icons";
@@ -95,22 +132,6 @@ fn tray_state(cs: &state::ClientState) -> TrayState {
     }
 }
 
-fn solid_icon(rgba: [u8; 4]) -> tray_icon::Icon {
-    let mut data = Vec::with_capacity(32 * 32 * 4);
-    for _ in 0..32 * 32 {
-        data.extend_from_slice(&rgba);
-    }
-    tray_icon::Icon::from_rgba(data, 32, 32).expect("valid icon")
-}
-
-fn tray_icon_for(t: &TrayState) -> tray_icon::Icon {
-    match t {
-        TrayState::Ok => solid_icon([0x2e, 0x7d, 0x32, 0xff]),
-        TrayState::OnBattery => solid_icon([0xf9, 0xa8, 0x25, 0xff]),
-        TrayState::Unreachable => solid_icon([0xc6, 0x28, 0x28, 0xff]),
-    }
-}
-
 enum GuiCmd {
     Show,
 }
@@ -139,6 +160,7 @@ pub struct ClientApp {
     config: Arc<Mutex<Config>>,
     poller: Arc<PollerControl>,
     tray: tray_icon::TrayIcon,
+    tray_icons: TrayIcons,
     _menu: Menu,
     rx: Receiver<GuiCmd>,
     visible: bool,
@@ -150,6 +172,7 @@ impl ClientApp {
     pub fn new(cc: &eframe::CreationContext<'_>, ctx: GuiContext) -> Self {
         install_material_font(&cc.egui_ctx);
 
+        let tray_icons = TrayIcons::load();
         let (tx, rx) = mpsc::channel::<GuiCmd>();
         let menu = Menu::new();
         let show = MenuItem::new("Show status", true, None);
@@ -160,7 +183,7 @@ impl ClientApp {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
             .with_tooltip("UPS Monitor — client")
-            .with_icon(tray_icon_for(&TrayState::Ok))
+            .with_icon(tray_icons.for_state(&TrayState::Ok))
             .build()
             .expect("failed to create tray icon");
 
@@ -205,6 +228,7 @@ impl ClientApp {
             config: ctx.config,
             poller: ctx.poller,
             tray,
+            tray_icons,
             _menu: menu,
             rx,
             // Start visible so status is immediately clear; closing the
@@ -315,7 +339,7 @@ impl eframe::App for ClientApp {
 
         let cs = state::snapshot(&self.state);
         let ts = tray_state(&cs);
-        let _ = self.tray.set_icon(Some(tray_icon_for(&ts)));
+        let _ = self.tray.set_icon(Some(self.tray_icons.for_state(&ts)));
         let tooltip = match ts {
             TrayState::Ok => "UPS Monitor — all online".to_string(),
             TrayState::OnBattery => "UPS Monitor — a UPS is on battery".to_string(),
