@@ -1,17 +1,20 @@
 //! Client configuration, loaded from `config.toml` next to the executable.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSection {
-    pub address: String,
+    /// The server's LAN address. `None` until the user sets one via the
+    /// "Server settings" dialog (or edits config.toml by hand).
+    #[serde(default)]
+    pub address: Option<String>,
     #[serde(default = "default_port")]
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollingSection {
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
@@ -20,13 +23,13 @@ pub struct PollingSection {
     pub unreachable_after_missed: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertsSection {
     #[serde(default = "default_threshold")]
     pub low_battery_threshold_pct: u8,
 }
 
-fn default_port() -> u16 {
+pub fn default_port() -> u16 {
     8420
 }
 fn default_interval() -> u64 {
@@ -39,6 +42,14 @@ fn default_threshold() -> u8 {
     20
 }
 
+impl Default for ServerSection {
+    fn default() -> Self {
+        Self {
+            address: None,
+            port: default_port(),
+        }
+    }
+}
 impl Default for PollingSection {
     fn default() -> Self {
         Self {
@@ -55,8 +66,9 @@ impl Default for AlertsSection {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub server: ServerSection,
     #[serde(default)]
     pub polling: PollingSection,
@@ -64,9 +76,25 @@ pub struct Config {
     pub alerts: AlertsSection,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerSection::default(),
+            polling: PollingSection::default(),
+            alerts: AlertsSection::default(),
+        }
+    }
+}
+
 impl Config {
+    /// Load `config.toml`, or fall back to defaults (no server address set)
+    /// if it doesn't exist yet — the GUI's "Server settings" dialog handles
+    /// that case rather than failing to start.
     pub fn load() -> Result<Self> {
         let path = config_path();
+        if !path.exists() {
+            return Ok(Config::default());
+        }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let cfg: Config =
@@ -74,8 +102,28 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn base_url(&self) -> String {
-        format!("http://{}:{}", self.server.address, self.server.port)
+    /// Write this config back to `config.toml` next to the executable.
+    pub fn save(&self) -> Result<()> {
+        let path = config_path();
+        let text = toml::to_string_pretty(self).context("failed to serialize config")?;
+        std::fs::write(&path, text)
+            .with_context(|| format!("failed to write config file {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn has_server(&self) -> bool {
+        self.server
+            .address
+            .as_deref()
+            .is_some_and(|a| !a.trim().is_empty())
+    }
+
+    pub fn base_url(&self) -> Option<String> {
+        let addr = self.server.address.as_deref()?;
+        if addr.trim().is_empty() {
+            return None;
+        }
+        Some(format!("http://{}:{}", addr.trim(), self.server.port))
     }
 }
 

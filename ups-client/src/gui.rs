@@ -2,6 +2,7 @@
 //! window listing each UPS and a "Connected / Unreachable" line.
 
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 
 use egui::{Color32, RichText};
 use material_icons::{icon_to_char, Icon};
@@ -9,10 +10,20 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use ups_common::PowerState;
 
+use crate::config::Config;
+use crate::poller::PollerControl;
 use crate::state::{self, Connectivity, SharedClientState};
 
 const FONT_NAME: &str = "material_icons";
 const ARIAL_NAME: &str = "arial";
+
+/// Everything the GUI needs to display status and manage the server
+/// connection live, not just render a snapshot.
+pub struct GuiContext {
+    pub state: SharedClientState,
+    pub config: Arc<Mutex<Config>>,
+    pub poller: Arc<PollerControl>,
+}
 
 pub fn install_material_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -90,17 +101,39 @@ enum GuiCmd {
     Show,
 }
 
+/// State for the "Server settings" dialog. Port is kept as text while being
+/// edited so an in-progress edit (e.g. an empty field) doesn't get clobbered
+/// by parse failures.
+struct ServerDialog {
+    address: String,
+    port: String,
+    error: Option<String>,
+}
+
+impl ServerDialog {
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            address: cfg.server.address.clone().unwrap_or_default(),
+            port: cfg.server.port.to_string(),
+            error: None,
+        }
+    }
+}
+
 pub struct ClientApp {
     state: SharedClientState,
+    config: Arc<Mutex<Config>>,
+    poller: Arc<PollerControl>,
     tray: tray_icon::TrayIcon,
     _menu: Menu,
     rx: Receiver<GuiCmd>,
     visible: bool,
     close_handled: bool,
+    server_dialog: Option<ServerDialog>,
 }
 
 impl ClientApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, state: SharedClientState) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, ctx: GuiContext) -> Self {
         install_material_font(&cc.egui_ctx);
 
         let (tx, rx) = mpsc::channel::<GuiCmd>();
@@ -120,13 +153,19 @@ impl ClientApp {
         {
             let show_id = show.id().clone();
             let quit_id = quit.id().clone();
+            // Drive the viewport straight from the tray thread: when the
+            // window is hidden, update() may not tick, so the mpsc command
+            // would never be processed. egui::Context is Send+Sync and
+            // viewport commands wake the event loop even while hidden.
+            let egui_ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || loop {
                 if let Ok(event) = MenuEvent::receiver().recv() {
                     if event.id == show_id {
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        egui_ctx.request_repaint();
                         let _ = tx.send(GuiCmd::Show);
                     } else if event.id == quit_id {
-                        // Exit straight from the tray thread — going through
-                        // the GUI update loop can hang after CancelClose.
                         std::process::exit(0);
                     }
                 }
@@ -136,8 +175,21 @@ impl ClientApp {
             let _ = TrayIconEvent::receiver().recv();
         });
 
+        // First run (or a config with no address yet): open the dialog
+        // immediately instead of showing an empty status list.
+        let server_dialog = {
+            let cfg = ctx.config.lock().unwrap();
+            if cfg.has_server() {
+                None
+            } else {
+                Some(ServerDialog::from_config(&cfg))
+            }
+        };
+
         Self {
-            state,
+            state: ctx.state,
+            config: ctx.config,
+            poller: ctx.poller,
             tray,
             _menu: menu,
             rx,
@@ -145,7 +197,45 @@ impl ClientApp {
             // window hides it to the tray.
             visible: true,
             close_handled: false,
+            server_dialog,
         }
+    }
+
+    fn commit_server_dialog(&mut self) {
+        let Some(dialog) = &self.server_dialog else {
+            return;
+        };
+        let address = dialog.address.trim().to_string();
+        if address.is_empty() {
+            self.server_dialog.as_mut().unwrap().error = Some("Address cannot be empty.".into());
+            return;
+        }
+        let port: u16 = match dialog.port.trim().parse() {
+            Ok(p) => p,
+            Err(_) => {
+                self.server_dialog.as_mut().unwrap().error =
+                    Some("Port must be a number between 1 and 65535.".into());
+                return;
+            }
+        };
+
+        let save_result = self.config.lock().map(|mut cfg| {
+            cfg.server.address = Some(address);
+            cfg.server.port = port;
+            cfg.save().map(|_| cfg.clone())
+        });
+        let cfg = match save_result.unwrap_or_else(|_| Err(anyhow::anyhow!("config lock poisoned"))) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                self.server_dialog.as_mut().unwrap().error =
+                    Some(format!("Failed to save config: {e}"));
+                return;
+            }
+        };
+
+        self.poller.restart(cfg, self.state.clone());
+        tracing::info!("server settings updated via GUI");
+        self.server_dialog = None;
     }
 }
 
@@ -220,8 +310,28 @@ impl eframe::App for ClientApp {
         let _ = self.tray.set_tooltip(Some(tooltip));
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("{} UPS Monitor — Client", ic(Icon::Power)));
+            ui.horizontal(|ui| {
+                ui.heading(format!("{} UPS Monitor — Client", ic(Icon::Power)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(format!("{}  Server settings", ic(Icon::Settings)))
+                        .clicked()
+                    {
+                        let cfg = self.config.lock().unwrap();
+                        self.server_dialog = Some(ServerDialog::from_config(&cfg));
+                    }
+                });
+            });
             ui.add_space(6.0);
+
+            let configured = self.config.lock().map(|c| c.has_server()).unwrap_or(false);
+            if !configured {
+                ui.label(
+                    RichText::new("No server configured yet — set one up in Server settings.")
+                        .color(Color32::from_rgb(0xff, 0x98, 0x00)),
+                );
+                ui.add_space(6.0);
+            }
 
             // Connectivity line.
             let (conn_icon, conn_text, conn_col) = match cs.connectivity {
@@ -242,11 +352,13 @@ impl eframe::App for ClientApp {
                     )
                 }
             };
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(conn_icon.to_string()).size(20.0).color(conn_col));
-                ui.label(RichText::new(conn_text).color(conn_col).strong());
-            });
-            ui.add_space(6.0);
+            if configured {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(conn_icon.to_string()).size(20.0).color(conn_col));
+                    ui.label(RichText::new(conn_text).color(conn_col).strong());
+                });
+                ui.add_space(6.0);
+            }
 
             if cs.statuses.is_empty() {
                 ui.label("No UPS data yet.");
@@ -256,6 +368,59 @@ impl eframe::App for ClientApp {
                 ui.add_space(6.0);
             }
         });
+
+        // "Server settings" dialog. No native close button: if no server is
+        // configured yet the dialog must be completed to proceed, and once
+        // one exists closing happens via Save/Cancel.
+        if let Some(dialog) = &self.server_dialog {
+            let mut address = dialog.address.clone();
+            let mut port = dialog.port.clone();
+            let error = dialog.error.clone();
+            let mut save_clicked = false;
+            let mut cancel_clicked = false;
+            let cancellable = self
+                .config
+                .lock()
+                .map(|c| c.has_server())
+                .unwrap_or(false);
+            egui::Window::new(format!("{} Server settings", ic(Icon::Settings)))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if let Some(err) = &error {
+                        ui.colored_label(Color32::from_rgb(0xc6, 0x28, 0x28), err);
+                        ui.add_space(6.0);
+                    }
+                    egui::Grid::new("server_settings_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Server address:");
+                            ui.text_edit_singleline(&mut address);
+                            ui.end_row();
+                            ui.label("Port:");
+                            ui.text_edit_singleline(&mut port);
+                            ui.end_row();
+                        });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            save_clicked = true;
+                        }
+                        if cancellable && ui.button("Cancel").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                });
+            if let Some(d) = self.server_dialog.as_mut() {
+                d.address = address;
+                d.port = port;
+            }
+            if save_clicked {
+                self.commit_server_dialog();
+            } else if cancel_clicked {
+                self.server_dialog = None;
+            }
+        }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
@@ -267,7 +432,7 @@ impl eframe::App for ClientApp {
     }
 }
 
-pub fn run(state: SharedClientState) -> eframe::Result<()> {
+pub fn run(ctx: GuiContext) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("UPS Monitor — Client")
@@ -278,6 +443,6 @@ pub fn run(state: SharedClientState) -> eframe::Result<()> {
     eframe::run_native(
         "ups-client",
         options,
-        Box::new(move |cc| Ok(Box::new(ClientApp::new(cc, state)))),
+        Box::new(move |cc| Ok(Box::new(ClientApp::new(cc, ctx)))),
     )
 }

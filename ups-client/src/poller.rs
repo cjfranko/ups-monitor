@@ -1,6 +1,8 @@
 //! Client polling loop: polls `GET /status`, feeds the transition detector,
 //! fires toasts, tracks connectivity, and updates shared state for the GUI.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -12,8 +14,44 @@ use crate::detect::TransitionDetector;
 use crate::notify;
 use crate::state::{self, SharedClientState};
 
-pub fn run(cfg: Config, shared: SharedClientState) {
-    let url = format!("{}/status", cfg.base_url());
+/// Owns the currently-running poller (if any) so the GUI can restart it with
+/// a new `Config` when the user changes the server address/port.
+pub struct PollerControl {
+    stop: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+impl PollerControl {
+    pub fn new() -> Self {
+        Self {
+            stop: Mutex::new(None),
+        }
+    }
+
+    /// Stop any running poller and start a new one with this config.
+    /// No-op (does not start) if `cfg` has no server address configured.
+    pub fn restart(&self, cfg: Config, shared: SharedClientState) {
+        self.stop_current();
+        if !cfg.has_server() {
+            return;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        *self.stop.lock().unwrap() = Some(flag.clone());
+        thread::spawn(move || run(cfg, shared, flag));
+    }
+
+    pub fn stop_current(&self) {
+        if let Some(flag) = self.stop.lock().unwrap().take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+fn run(cfg: Config, shared: SharedClientState, stop: Arc<AtomicBool>) {
+    let Some(base_url) = cfg.base_url() else {
+        warn!("poller started without a server address configured");
+        return;
+    };
+    let url = format!("{base_url}/status");
     let interval = Duration::from_secs(cfg.polling.interval_secs);
     let unreachable_after = cfg.polling.unreachable_after_missed;
     let mut detector = TransitionDetector::new(cfg.alerts.low_battery_threshold_pct);
@@ -28,7 +66,7 @@ pub fn run(cfg: Config, shared: SharedClientState) {
 
     info!(%url, interval_s = cfg.polling.interval_secs, "client poller started");
 
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         match client.get(&url).send() {
             Ok(resp) => match resp.json::<Vec<UpsStatus>>() {
                 Ok(statuses) => {
@@ -65,4 +103,5 @@ pub fn run(cfg: Config, shared: SharedClientState) {
 
         thread::sleep(interval);
     }
+    info!(%url, "client poller stopped");
 }
