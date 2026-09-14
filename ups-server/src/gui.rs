@@ -3,17 +3,30 @@
 //! Reads straight from the same shared state the API serves — no extra polling.
 
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 
 use egui::{Color32, RichText};
+use hidapi::HidApi;
 use material_icons::{icon_to_char, Icon};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use ups_common::PowerState;
 
+use crate::config::{Config, UpsEntry};
+use crate::hid::{self, DiscoveredUps};
+use crate::poller::{self, PollerHandles};
 use crate::state::{self, SharedState};
 
 const FONT_NAME: &str = "material_icons";
 const ARIAL_NAME: &str = "arial";
+
+/// Everything the GUI needs to manage UPS units live, not just display them.
+pub struct GuiContext {
+    pub state: SharedState,
+    pub handles: PollerHandles,
+    pub config: Arc<Mutex<Config>>,
+    pub mock_mode: bool,
+}
 
 pub fn install_material_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -93,17 +106,41 @@ enum GuiCmd {
     Show,
 }
 
+/// State for the "Add UPS" dialog: a USB scan result plus one id text-edit
+/// buffer per discovered-but-unconfigured device.
+#[derive(Default)]
+struct AddDialog {
+    open: bool,
+    scanned: bool,
+    discovered: Vec<DiscoveredUps>,
+    id_buffers: std::collections::HashMap<String, String>, // keyed by serial
+    error: Option<String>,
+}
+
+/// State for the "Rename UPS" dialog.
+struct RenameDialog {
+    old_id: String,
+    buffer: String,
+    error: Option<String>,
+}
+
 pub struct StatusApp {
     state: SharedState,
+    handles: PollerHandles,
+    config: Arc<Mutex<Config>>,
+    mock_mode: bool,
     tray: tray_icon::TrayIcon,
     _menu: Menu,
     rx: Receiver<GuiCmd>,
     visible: bool,
     close_handled: bool,
+    add_dialog: AddDialog,
+    rename_dialog: Option<RenameDialog>,
+    delete_target: Option<String>,
 }
 
 impl StatusApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, state: SharedState) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, ctx: GuiContext) -> Self {
         install_material_font(&cc.egui_ctx);
 
         let (tx, rx) = mpsc::channel::<GuiCmd>();
@@ -124,9 +161,17 @@ impl StatusApp {
         {
             let show_id = show.id().clone();
             let quit_id = quit.id().clone();
+            // Drive the viewport straight from the tray thread: when the
+            // window is hidden, update() may not tick, so the mpsc command
+            // would never be processed. egui::Context is Send+Sync and
+            // viewport commands wake the event loop even while hidden.
+            let egui_ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || loop {
                 if let Ok(event) = MenuEvent::receiver().recv() {
                     if event.id == show_id {
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        egui_ctx.request_repaint();
                         let _ = tx.send(GuiCmd::Show);
                     } else if event.id == quit_id {
                         // Exit straight from the tray thread — going through
@@ -142,7 +187,10 @@ impl StatusApp {
         });
 
         Self {
-            state,
+            state: ctx.state,
+            handles: ctx.handles,
+            config: ctx.config,
+            mock_mode: ctx.mock_mode,
             tray,
             _menu: menu,
             rx,
@@ -150,12 +198,192 @@ impl StatusApp {
             // the window hides it to the tray.
             visible: true,
             close_handled: false,
+            add_dialog: AddDialog::default(),
+            rename_dialog: None,
+            delete_target: None,
         }
+    }
+
+    /// Ids currently in the config, for uniqueness checks.
+    fn existing_ids(&self) -> Vec<String> {
+        self.config
+            .lock()
+            .map(|c| c.ups.iter().map(|u| u.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Add a newly-discovered UPS to the config, live state, and start a
+    /// poller for it.
+    fn commit_add(&mut self, serial: &str, id: String) {
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            self.add_dialog.error = Some("Id cannot be empty.".into());
+            return;
+        }
+        if self.existing_ids().iter().any(|e| e == &id) {
+            self.add_dialog.error = Some(format!("Id \"{id}\" is already in use."));
+            return;
+        }
+
+        let entry = UpsEntry {
+            id: id.clone(),
+            serial: serial.to_string(),
+        };
+        let save_result = self.config.lock().map(|mut cfg| {
+            cfg.ups.push(entry.clone());
+            cfg.save()
+        });
+        if let Err(e) = save_result.unwrap_or_else(|_| Err(anyhow::anyhow!("config lock poisoned"))) {
+            self.add_dialog.error = Some(format!("Failed to save config: {e}"));
+            return;
+        }
+
+        state::ensure_entry(&self.state, &id);
+        if self.mock_mode {
+            poller::spawn_mock_poller(&self.handles, self.state.clone(), id.clone());
+        } else {
+            poller::spawn_real_poller(&self.handles, self.state.clone(), entry);
+        }
+
+        self.add_dialog.discovered.retain(|d| d.serial != serial);
+        self.add_dialog.id_buffers.remove(serial);
+        self.add_dialog.error = None;
+        tracing::info!(ups = %id, serial = %serial, "UPS added via GUI");
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(dialog) = &self.rename_dialog else {
+            return;
+        };
+        let old_id = dialog.old_id.clone();
+        let new_id = dialog.buffer.trim().to_string();
+
+        if new_id.is_empty() {
+            self.rename_dialog.as_mut().unwrap().error = Some("Id cannot be empty.".into());
+            return;
+        }
+        if new_id == old_id {
+            self.rename_dialog = None;
+            return;
+        }
+        if self.existing_ids().iter().any(|e| e == &new_id) {
+            self.rename_dialog.as_mut().unwrap().error =
+                Some(format!("Id \"{new_id}\" is already in use."));
+            return;
+        }
+
+        let save_result = self.config.lock().map(|mut cfg| {
+            let mut serial = String::new();
+            for u in cfg.ups.iter_mut() {
+                if u.id == old_id {
+                    u.id = new_id.clone();
+                    serial = u.serial.clone();
+                }
+            }
+            cfg.save().map(|_| serial)
+        });
+        let serial = match save_result.unwrap_or_else(|_| Err(anyhow::anyhow!("config lock poisoned"))) {
+            Ok(serial) => serial,
+            Err(e) => {
+                self.rename_dialog.as_mut().unwrap().error =
+                    Some(format!("Failed to save config: {e}"));
+                return;
+            }
+        };
+
+        // Respawn the poller under the new id: the running one still labels
+        // every reading with the id it was started with.
+        poller::stop_poller(&self.handles, &old_id);
+        state::rename(&self.state, &old_id, &new_id);
+        if self.mock_mode {
+            poller::spawn_mock_poller(&self.handles, self.state.clone(), new_id.clone());
+        } else {
+            poller::spawn_real_poller(
+                &self.handles,
+                self.state.clone(),
+                UpsEntry {
+                    id: new_id.clone(),
+                    serial,
+                },
+            );
+        }
+
+        tracing::info!(old = %old_id, new = %new_id, "UPS renamed via GUI");
+        self.rename_dialog = None;
+    }
+
+    fn commit_delete(&mut self, id: &str) {
+        poller::stop_poller(&self.handles, id);
+        state::remove(&self.state, id);
+        let save_result = self.config.lock().map(|mut cfg| {
+            cfg.ups.retain(|u| u.id != id);
+            cfg.save()
+        });
+        if let Err(e) = save_result.unwrap_or_else(|_| Err(anyhow::anyhow!("config lock poisoned"))) {
+            tracing::warn!(error = %e, "failed to save config after deleting UPS");
+        }
+        tracing::info!(ups = %id, "UPS deleted via GUI");
+    }
+
+    fn scan_for_ups(&mut self) {
+        self.add_dialog.scanned = true;
+        self.add_dialog.error = None;
+        match HidApi::new() {
+            Ok(api) => {
+                let configured: Vec<String> =
+                    self.existing_ids_serials();
+                self.add_dialog.discovered = hid::enumerate_ups(&api)
+                    .into_iter()
+                    .filter(|d| !configured.contains(&d.serial))
+                    .collect();
+                for d in &self.add_dialog.discovered {
+                    self.add_dialog
+                        .id_buffers
+                        .entry(d.serial.clone())
+                        .or_insert_with(|| suggest_id(d));
+                }
+            }
+            Err(e) => {
+                self.add_dialog.error = Some(format!("HID scan failed: {e}"));
+                self.add_dialog.discovered.clear();
+            }
+        }
+    }
+
+    fn existing_ids_serials(&self) -> Vec<String> {
+        self.config
+            .lock()
+            .map(|c| c.ups.iter().map(|u| u.serial.clone()).collect())
+            .unwrap_or_default()
     }
 }
 
-fn ups_card(ui: &mut egui::Ui, s: &ups_common::UpsStatus) {
+/// Suggest a default id for a freshly-discovered UPS from its product name
+/// (or fall back to a short form of the serial).
+fn suggest_id(d: &DiscoveredUps) -> String {
+    if !d.product.trim().is_empty() {
+        d.product
+            .trim()
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect()
+    } else {
+        format!("ups-{}", &d.serial.chars().rev().take(4).collect::<String>())
+    }
+}
+
+/// What the user asked to do with a UPS card, if anything.
+enum CardAction {
+    None,
+    Rename,
+    Delete,
+}
+
+/// Renders one UPS card. Returns which action button (if any) was clicked.
+fn ups_card(ui: &mut egui::Ui, s: &ups_common::UpsStatus) -> CardAction {
     let (ic, col) = state_icon(s.status);
+    let mut action = CardAction::None;
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
@@ -173,6 +401,20 @@ fn ups_card(ui: &mut egui::Ui, s: &ups_common::UpsStatus) {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&s.id).strong().size(16.0));
+                        if ui
+                            .small_button(icon_char(Icon::Edit).to_string())
+                            .on_hover_text("Rename")
+                            .clicked()
+                        {
+                            action = CardAction::Rename;
+                        }
+                        if ui
+                            .small_button(icon_char(Icon::Delete).to_string())
+                            .on_hover_text("Delete")
+                            .clicked()
+                        {
+                            action = CardAction::Delete;
+                        }
                         ui.add_space(6.0);
                         ui.label(RichText::new(format!("{}", s.status)).color(col).strong());
                     });
@@ -189,6 +431,7 @@ fn ups_card(ui: &mut egui::Ui, s: &ups_common::UpsStatus) {
                 });
             });
         });
+    action
 }
 
 impl eframe::App for StatusApp {
@@ -226,7 +469,20 @@ impl eframe::App for StatusApp {
         let _ = self.tray.set_tooltip(Some(tooltip));
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("{} UPS Monitor — Server", icon_char(Icon::Power)));
+            ui.horizontal(|ui| {
+                ui.heading(format!("{} UPS Monitor — Server", icon_char(Icon::Power)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(format!("{}  Add UPS", icon_char(Icon::Add)))
+                        .clicked()
+                    {
+                        self.add_dialog.open = true;
+                        self.add_dialog.scanned = false;
+                        self.add_dialog.discovered.clear();
+                        self.add_dialog.error = None;
+                    }
+                });
+            });
             ui.add_space(6.0);
 
             // Simulation toggle: forces every UPS to report OnBattery so the
@@ -255,11 +511,150 @@ impl eframe::App for StatusApp {
             if statuses.is_empty() {
                 ui.label("No UPS units configured.");
             }
+            let mut rename_requested: Option<String> = None;
+            let mut delete_requested: Option<String> = None;
             for s in &statuses {
-                ups_card(ui, s);
+                match ups_card(ui, s) {
+                    CardAction::Rename => rename_requested = Some(s.id.clone()),
+                    CardAction::Delete => delete_requested = Some(s.id.clone()),
+                    CardAction::None => {}
+                }
                 ui.add_space(6.0);
             }
+            if let Some(id) = rename_requested {
+                self.rename_dialog = Some(RenameDialog {
+                    buffer: id.clone(),
+                    old_id: id,
+                    error: None,
+                });
+            }
+            if let Some(id) = delete_requested {
+                self.delete_target = Some(id);
+            }
         });
+
+        // "Add UPS" dialog: scan USB, offer to add anything not yet configured.
+        if self.add_dialog.open {
+            let mut open = true;
+            let mut do_scan = false;
+            let mut commit: Option<(String, String)> = None;
+            egui::Window::new(format!("{} Add UPS", icon_char(Icon::Usb)))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if ui.button("Scan USB ports").clicked() {
+                        do_scan = true;
+                    }
+                    ui.add_space(6.0);
+                    if let Some(err) = &self.add_dialog.error {
+                        ui.colored_label(Color32::from_rgb(0xc6, 0x28, 0x28), err);
+                        ui.add_space(6.0);
+                    }
+                    if self.add_dialog.scanned && self.add_dialog.discovered.is_empty() {
+                        ui.label("No unconfigured UPS units found on USB.");
+                    }
+                    for d in self.add_dialog.discovered.clone() {
+                        ui.separator();
+                        ui.label(RichText::new(&d.product).strong());
+                        ui.small(format!("Serial: {}", d.serial));
+                        ui.horizontal(|ui| {
+                            ui.label("Id:");
+                            let buf = self
+                                .add_dialog
+                                .id_buffers
+                                .entry(d.serial.clone())
+                                .or_insert_with(|| suggest_id(&d));
+                            ui.text_edit_singleline(buf);
+                            if ui.button("Add").clicked() {
+                                commit = Some((d.serial.clone(), buf.clone()));
+                            }
+                        });
+                    }
+                });
+            if do_scan {
+                self.scan_for_ups();
+            }
+            if let Some((serial, id)) = commit {
+                self.commit_add(&serial, id);
+            }
+            self.add_dialog.open = open;
+        }
+
+        // "Rename UPS" dialog.
+        if let Some(dialog) = &self.rename_dialog {
+            let mut open = true;
+            let mut buffer = dialog.buffer.clone();
+            let mut save_clicked = false;
+            let mut cancel_clicked = false;
+            let old_id = dialog.old_id.clone();
+            let error = dialog.error.clone();
+            egui::Window::new(format!("Rename \"{old_id}\""))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(err) = &error {
+                        ui.colored_label(Color32::from_rgb(0xc6, 0x28, 0x28), err);
+                        ui.add_space(6.0);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("New id:");
+                        let resp = ui.text_edit_singleline(&mut buffer);
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            save_clicked = true;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            save_clicked = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                });
+            if let Some(d) = self.rename_dialog.as_mut() {
+                d.buffer = buffer;
+            }
+            if save_clicked {
+                self.commit_rename();
+            } else if cancel_clicked || !open {
+                self.rename_dialog = None;
+            }
+        }
+
+        // "Delete UPS" confirmation.
+        if let Some(id) = self.delete_target.clone() {
+            let mut open = true;
+            let mut confirm_clicked = false;
+            let mut cancel_clicked = false;
+            egui::Window::new(format!("Delete \"{id}\"?"))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("This removes it from the config and stops polling it.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let btn = egui::Button::new(RichText::new("Delete").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(0xc6, 0x28, 0x28));
+                        if ui.add(btn).clicked() {
+                            confirm_clicked = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                });
+            if confirm_clicked {
+                self.commit_delete(&id);
+                self.delete_target = None;
+            } else if cancel_clicked || !open {
+                self.delete_target = None;
+            }
+        }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
@@ -271,7 +666,7 @@ impl eframe::App for StatusApp {
     }
 }
 
-pub fn run(state: SharedState) -> eframe::Result<()> {
+pub fn run(ctx: GuiContext) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("UPS Monitor — Server")
@@ -282,6 +677,6 @@ pub fn run(state: SharedState) -> eframe::Result<()> {
     eframe::run_native(
         "ups-server",
         options,
-        Box::new(move |cc| Ok(Box::new(StatusApp::new(cc, state)))),
+        Box::new(move |cc| Ok(Box::new(StatusApp::new(cc, ctx)))),
     )
 }

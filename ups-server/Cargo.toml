@@ -21,3 +21,8 @@ eframe = "0.29"
 egui = "0.29"
 material-icons = "0.3"
 rand = "0.8"
+tracing-appender = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Used to surface fatal startup errors from the windowed exe (no console).
+native-dialog = "0.7"

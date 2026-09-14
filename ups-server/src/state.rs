@@ -53,3 +53,30 @@ pub fn snapshot(state: &SharedState) -> Vec<UpsStatus> {
         Err(_) => Vec::new(),
     }
 }
+
+/// Add a newly-configured UPS as `Unknown` until its poller reports in.
+/// No-op if an entry with this id already exists.
+pub fn ensure_entry(state: &SharedState, id: &str) {
+    if let Ok(mut map) = state.write() {
+        map.entry(id.to_string())
+            .or_insert_with(|| UpsStatus::unknown(id));
+    }
+}
+
+/// Move an entry to a new id, carrying over its last-known status.
+pub fn rename(state: &SharedState, old_id: &str, new_id: &str) {
+    if let Ok(mut map) = state.write() {
+        let mut status = map
+            .remove(old_id)
+            .unwrap_or_else(|| UpsStatus::unknown(new_id));
+        status.id = new_id.to_string();
+        map.insert(new_id.to_string(), status);
+    }
+}
+
+/// Drop an entry entirely (UPS removed from config).
+pub fn remove(state: &SharedState, id: &str) {
+    if let Ok(mut map) = state.write() {
+        map.remove(id);
+    }
+}

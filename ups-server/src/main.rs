@@ -8,16 +8,60 @@ mod poller;
 mod state;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-fn main() -> Result<()> {
+/// Show a fatal error to the user. This is a windowed exe (no console), so
+/// without a message box a startup failure looks like an instant, silent
+/// crash.
+fn fatal_popup(msg: &str) {
+    eprintln!("ups-server fatal: {msg}");
+    #[cfg(windows)]
+    {
+        let _ = native_dialog::MessageDialog::new()
+            .set_type(native_dialog::MessageType::Error)
+            .set_title("UPS Monitor — Server")
+            .set_text(msg)
+            .show_alert();
+    }
+}
+
+/// Install a panic hook that surfaces panics (windowed exe swallows them).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("ups-server panicked: {info}");
+        error!("{msg}");
+        fatal_popup(&msg);
+    }));
+}
+
+/// Path for the log file: next to the executable.
+fn log_path() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("ups-server.log");
+        }
+    }
+    std::path::PathBuf::from("ups-server.log")
+}
+
+fn run() -> Result<()> {
+    // Log to a file next to the exe so failures are diagnosable on machines
+    // without a console (this is a windowed exe).
+    let log_dir = log_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let file_appender = tracing_appender::rolling::never(log_dir, "ups-server.log");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(file_appender)
+        .with_ansi(false)
         .init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -39,6 +83,7 @@ fn main() -> Result<()> {
     );
 
     let shared = state::new_shared_state(&cfg.ups);
+    let handles = poller::new_handles();
 
     // Start polling.
     if mock_mode {
@@ -46,12 +91,12 @@ fn main() -> Result<()> {
         if !mock_fail.is_empty() {
             warn!(?mock_fail, "mock mode: forcing these UPS on battery");
         }
-        poller::spawn_mock_pollers(shared.clone(), ids, mock_fail);
+        poller::spawn_mock_pollers(&handles, shared.clone(), ids, mock_fail);
     } else {
         if let Err(e) = poller::log_discovery() {
             warn!(error = %e, "HID discovery failed");
         }
-        poller::spawn_real_pollers(shared.clone(), cfg.ups.clone());
+        poller::spawn_real_pollers(&handles, shared.clone(), cfg.ups.clone());
     }
 
     // Start the HTTP API on a background tokio runtime.
@@ -63,16 +108,39 @@ fn main() -> Result<()> {
         rt.block_on(async move {
             let app = api::router(api_state);
             let addr = format!("{bind_ip}:{port}");
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .expect("bind API listener");
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(%addr, error = %e, "failed to bind API listener (port in use?)");
+                    fatal_popup(&format!("Cannot bind {addr}: {e}\n\nIs another instance of ups-server already running?"));
+                    std::process::exit(1);
+                }
+            };
             info!(%addr, "API listening");
-            axum::serve(listener, app).await.expect("serve API");
+            if let Err(e) = axum::serve(listener, app).await {
+                error!(error = %e, "API server stopped");
+            }
         });
     });
 
     // GUI runs on the main thread.
-    gui::run(shared).map_err(|e| anyhow::anyhow!("GUI error: {e}"))?;
+    let gui_ctx = gui::GuiContext {
+        state: shared,
+        handles,
+        config: Arc::new(std::sync::Mutex::new(cfg)),
+        mock_mode,
+    };
+    gui::run(gui_ctx).map_err(|e| anyhow::anyhow!("GUI error: {e}"))?;
 
     Ok(())
+}
+
+fn main() {
+    install_panic_hook();
+    if let Err(e) = run() {
+        let msg = format!("{e:#}");
+        error!("{msg}");
+        fatal_popup(&msg);
+        std::process::exit(1);
+    }
 }
