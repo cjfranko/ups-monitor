@@ -12,9 +12,23 @@ use ups_common::PowerState;
 use crate::state::{self, Connectivity, SharedClientState};
 
 const FONT_NAME: &str = "material_icons";
+const ARIAL_NAME: &str = "arial";
 
 pub fn install_material_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    // Primary UI font: Arial from the Windows fonts folder (fall back to
+    // egui's bundled font if it can't be read).
+    if let Ok(arial) = std::fs::read(r"C:\Windows\Fonts\arial.ttf") {
+        fonts
+            .font_data
+            .insert(ARIAL_NAME.to_owned(), egui::FontData::from_owned(arial));
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, ARIAL_NAME.to_owned());
+    }
+    // Icon font as fallback for material icon codepoints.
     fonts.font_data.insert(
         FONT_NAME.to_owned(),
         egui::FontData::from_static(material_icons::FONT),
@@ -23,7 +37,7 @@ pub fn install_material_font(ctx: &egui::Context) {
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, FONT_NAME.to_owned());
+        .push(FONT_NAME.to_owned());
     ctx.set_fonts(fonts);
 }
 
@@ -74,7 +88,6 @@ fn tray_icon_for(t: &TrayState) -> tray_icon::Icon {
 
 enum GuiCmd {
     Show,
-    Quit,
 }
 
 pub struct ClientApp {
@@ -83,6 +96,7 @@ pub struct ClientApp {
     _menu: Menu,
     rx: Receiver<GuiCmd>,
     visible: bool,
+    close_handled: bool,
 }
 
 impl ClientApp {
@@ -111,7 +125,9 @@ impl ClientApp {
                     if event.id == show_id {
                         let _ = tx.send(GuiCmd::Show);
                     } else if event.id == quit_id {
-                        let _ = tx.send(GuiCmd::Quit);
+                        // Exit straight from the tray thread — going through
+                        // the GUI update loop can hang after CancelClose.
+                        std::process::exit(0);
                     }
                 }
             });
@@ -125,9 +141,49 @@ impl ClientApp {
             tray,
             _menu: menu,
             rx,
-            visible: false,
+            // Start visible so status is immediately clear; closing the
+            // window hides it to the tray.
+            visible: true,
+            close_handled: false,
         }
     }
+}
+
+fn ups_card(ui: &mut egui::Ui, s: &ups_common::UpsStatus) {
+    let (icon, col) = state_icon(s.status);
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(36.0, 60.0),
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        ui.label(RichText::new(icon.to_string()).size(30.0).color(col));
+                    },
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&s.id).strong().size(16.0));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(format!("{}", s.status)).color(col).strong());
+                    });
+                    let battery = s
+                        .battery_pct
+                        .map(|p| format!("{p}%"))
+                        .unwrap_or_else(|| "—".to_string());
+                    let runtime = s
+                        .runtime_secs
+                        .map(|r| format!("{} min", r / 60))
+                        .unwrap_or_else(|| "—".to_string());
+                    ui.label(format!("Battery: {battery}   Runtime: {runtime}"));
+                    ui.small(format!("Updated {}", s.last_updated.format("%H:%M:%S")));
+                });
+            });
+        });
 }
 
 impl eframe::App for ClientApp {
@@ -136,14 +192,21 @@ impl eframe::App for ClientApp {
             match cmd {
                 GuiCmd::Show => {
                     self.visible = true;
+                    self.close_handled = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                GuiCmd::Quit => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    std::process::exit(0);
-                }
             }
+        }
+
+        // Close button hides to tray rather than quitting. Only cancel the
+        // close once — re-cancelling every frame while the request is still
+        // pending interferes with rendering.
+        if ctx.input(|i| i.viewport().close_requested()) && self.visible && !self.close_handled {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.visible = false;
+            self.close_handled = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         let cs = state::snapshot(&self.state);
@@ -156,59 +219,43 @@ impl eframe::App for ClientApp {
         };
         let _ = self.tray.set_tooltip(Some(tooltip));
 
-        if self.visible {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading(format!("{} UPS Monitor — Client", ic(Icon::Power)));
-                ui.separator();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading(format!("{} UPS Monitor — Client", ic(Icon::Power)));
+            ui.add_space(6.0);
 
-                // Connectivity line.
-                let (conn_icon, conn_text, conn_col) = match cs.connectivity {
-                    Connectivity::Connected => (
-                        ic(Icon::Wifi),
-                        "Connected to server".to_string(),
-                        Color32::from_rgb(0x4c, 0xaf, 0x50),
-                    ),
-                    Connectivity::Unreachable => {
-                        let last = cs
-                            .last_success
-                            .map(|t| format!(" — last seen {}", t.format("%H:%M:%S")))
-                            .unwrap_or_default();
-                        (
-                            ic(Icon::WifiOff),
-                            format!("Unreachable{last}"),
-                            Color32::from_rgb(0xc6, 0x28, 0x28),
-                        )
-                    }
-                };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(conn_icon.to_string()).size(20.0).color(conn_col));
-                    ui.label(RichText::new(conn_text).color(conn_col).strong());
-                });
-                ui.separator();
-
-                if cs.statuses.is_empty() {
-                    ui.label("No UPS data yet.");
+            // Connectivity line.
+            let (conn_icon, conn_text, conn_col) = match cs.connectivity {
+                Connectivity::Connected => (
+                    ic(Icon::Wifi),
+                    "Connected to server".to_string(),
+                    Color32::from_rgb(0x4c, 0xaf, 0x50),
+                ),
+                Connectivity::Unreachable => {
+                    let last = cs
+                        .last_success
+                        .map(|t| format!(" — last seen {}", t.format("%H:%M:%S")))
+                        .unwrap_or_default();
+                    (
+                        ic(Icon::WifiOff),
+                        format!("Unreachable{last}"),
+                        Color32::from_rgb(0xc6, 0x28, 0x28),
+                    )
                 }
-                for s in &cs.statuses {
-                    ui.horizontal(|ui| {
-                        let (icon, col) = state_icon(s.status);
-                        ui.label(RichText::new(icon.to_string()).size(22.0).color(col));
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&s.id).strong());
-                            ui.label(format!("Status: {}", s.status));
-                            if let Some(p) = s.battery_pct {
-                                ui.label(format!("Battery: {p}%"));
-                            }
-                            if let Some(r) = s.runtime_secs {
-                                ui.label(format!("Runtime: {} min", r / 60));
-                            }
-                            ui.small(format!("Updated {}", s.last_updated.format("%H:%M:%S")));
-                        });
-                    });
-                    ui.separator();
-                }
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(conn_icon.to_string()).size(20.0).color(conn_col));
+                ui.label(RichText::new(conn_text).color(conn_col).strong());
             });
-        }
+            ui.add_space(6.0);
+
+            if cs.statuses.is_empty() {
+                ui.label("No UPS data yet.");
+            }
+            for s in &cs.statuses {
+                ups_card(ui, s);
+                ui.add_space(6.0);
+            }
+        });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
@@ -224,8 +271,8 @@ pub fn run(state: SharedClientState) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("UPS Monitor — Client")
-            .with_inner_size([360.0, 460.0])
-            .with_visible(false),
+            .with_inner_size([420.0, 520.0])
+            .with_visible(true),
         ..Default::default()
     };
     eframe::run_native(

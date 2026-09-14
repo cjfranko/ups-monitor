@@ -53,19 +53,22 @@ pub fn enumerate_ups(api: &HidApi) -> Vec<DiscoveredUps> {
         })
         .map(|d| DiscoveredUps {
             path: d.path().to_string_lossy().to_string(),
-            serial: d.serial_number().unwrap_or_default().to_string(),
+            // APC pads serials with trailing spaces; trim for config matching.
+            serial: d.serial_number().unwrap_or_default().trim().to_string(),
             product: d.product_string().unwrap_or_default().to_string(),
         })
         .collect()
 }
 
 /// Open a UPS by serial number. Returns `None` if not found right now.
+/// Comparison trims whitespace on both sides (APC pads serials with spaces).
 pub fn open_by_serial(api: &HidApi, serial: &str) -> Option<HidDevice> {
+    let wanted = serial.trim();
     api.device_list()
         .find(|d| {
             d.vendor_id() == APC_VENDOR_ID
                 && d.usage_page() == UPS_USAGE_PAGE
-                && d.serial_number().unwrap_or_default() == serial
+                && d.serial_number().unwrap_or_default().trim() == wanted
         })
         .and_then(|d| d.open_device(api).ok())
 }

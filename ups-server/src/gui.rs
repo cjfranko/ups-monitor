@@ -13,9 +13,23 @@ use ups_common::PowerState;
 use crate::state::{self, SharedState};
 
 const FONT_NAME: &str = "material_icons";
+const ARIAL_NAME: &str = "arial";
 
 pub fn install_material_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    // Primary UI font: Arial from the Windows fonts folder (fall back to
+    // egui's bundled font if it can't be read).
+    if let Ok(arial) = std::fs::read(r"C:\Windows\Fonts\arial.ttf") {
+        fonts
+            .font_data
+            .insert(ARIAL_NAME.to_owned(), egui::FontData::from_owned(arial));
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, ARIAL_NAME.to_owned());
+    }
+    // Icon font as fallback for material icon codepoints.
     fonts.font_data.insert(
         FONT_NAME.to_owned(),
         egui::FontData::from_static(material_icons::FONT),
@@ -24,7 +38,7 @@ pub fn install_material_font(ctx: &egui::Context) {
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, FONT_NAME.to_owned());
+        .push(FONT_NAME.to_owned());
     ctx.set_fonts(fonts);
 }
 
@@ -77,7 +91,6 @@ fn health_icon(h: &Health) -> tray_icon::Icon {
 
 enum GuiCmd {
     Show,
-    Quit,
 }
 
 pub struct StatusApp {
@@ -86,6 +99,7 @@ pub struct StatusApp {
     _menu: Menu,
     rx: Receiver<GuiCmd>,
     visible: bool,
+    close_handled: bool,
 }
 
 impl StatusApp {
@@ -115,7 +129,9 @@ impl StatusApp {
                     if event.id == show_id {
                         let _ = tx.send(GuiCmd::Show);
                     } else if event.id == quit_id {
-                        let _ = tx.send(GuiCmd::Quit);
+                        // Exit straight from the tray thread — going through
+                        // the GUI update loop can hang after CancelClose.
+                        std::process::exit(0);
                     }
                 }
             });
@@ -130,9 +146,49 @@ impl StatusApp {
             tray,
             _menu: menu,
             rx,
-            visible: false,
+            // Start visible so the user immediately sees UPS status; closing
+            // the window hides it to the tray.
+            visible: true,
+            close_handled: false,
         }
     }
+}
+
+fn ups_card(ui: &mut egui::Ui, s: &ups_common::UpsStatus) {
+    let (ic, col) = state_icon(s.status);
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(36.0, 60.0),
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        ui.label(RichText::new(ic.to_string()).size(30.0).color(col));
+                    },
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&s.id).strong().size(16.0));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(format!("{}", s.status)).color(col).strong());
+                    });
+                    let battery = s
+                        .battery_pct
+                        .map(|p| format!("{p}%"))
+                        .unwrap_or_else(|| "—".to_string());
+                    let runtime = s
+                        .runtime_secs
+                        .map(|r| format!("{} min", r / 60))
+                        .unwrap_or_else(|| "—".to_string());
+                    ui.label(format!("Battery: {battery}   Runtime: {runtime}"));
+                    ui.small(format!("Updated {}", s.last_updated.format("%H:%M:%S")));
+                });
+            });
+        });
 }
 
 impl eframe::App for StatusApp {
@@ -142,14 +198,21 @@ impl eframe::App for StatusApp {
             match cmd {
                 GuiCmd::Show => {
                     self.visible = true;
+                    self.close_handled = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                GuiCmd::Quit => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    std::process::exit(0);
-                }
             }
+        }
+
+        // Close button hides to tray rather than quitting. Only cancel the
+        // close once — re-cancelling every frame while the request is still
+        // pending interferes with rendering.
+        if ctx.input(|i| i.viewport().close_requested()) && self.visible && !self.close_handled {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.visible = false;
+            self.close_handled = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         let statuses = state::snapshot(&self.state);
@@ -162,33 +225,41 @@ impl eframe::App for StatusApp {
         };
         let _ = self.tray.set_tooltip(Some(tooltip));
 
-        if self.visible {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading(format!("{} UPS Monitor — Server", icon_char(Icon::Power)));
-                ui.separator();
-                for s in &statuses {
-                    ui.horizontal(|ui| {
-                        let (ic, col) = state_icon(s.status);
-                        ui.label(RichText::new(ic.to_string()).size(22.0).color(col));
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&s.id).strong());
-                            ui.label(format!("Status: {}", s.status));
-                            if let Some(p) = s.battery_pct {
-                                ui.label(format!("Battery: {p}%"));
-                            }
-                            if let Some(r) = s.runtime_secs {
-                                ui.label(format!("Runtime: {} min", r / 60));
-                            }
-                            ui.small(format!(
-                                "Updated {}",
-                                s.last_updated.format("%H:%M:%S")
-                            ));
-                        });
-                    });
-                    ui.separator();
-                }
-            });
-        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading(format!("{} UPS Monitor — Server", icon_char(Icon::Power)));
+            ui.add_space(6.0);
+
+            // Simulation toggle: forces every UPS to report OnBattery so the
+            // clients' alert paths can be tested without touching hardware.
+            let sim = state::simulate_on_battery();
+            let label = if sim {
+                "■ Stop simulation (ON BATTERY)"
+            } else {
+                "Simulate UPS on Battery"
+            };
+            let btn = egui::Button::new(RichText::new(label).color(Color32::WHITE).strong())
+                .fill(Color32::from_rgb(0xc6, 0x28, 0x28));
+            if ui.add(btn).clicked() {
+                state::set_simulate_on_battery(!sim);
+                tracing::info!(enabled = !sim, "on-battery simulation toggled");
+            }
+            if sim {
+                ui.label(
+                    RichText::new("Simulation active: all units report OnBattery")
+                        .color(Color32::from_rgb(0xc6, 0x28, 0x28))
+                        .small(),
+                );
+            }
+            ui.add_space(6.0);
+
+            if statuses.is_empty() {
+                ui.label("No UPS units configured.");
+            }
+            for s in &statuses {
+                ups_card(ui, s);
+                ui.add_space(6.0);
+            }
+        });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
@@ -204,8 +275,8 @@ pub fn run(state: SharedState) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("UPS Monitor — Server")
-            .with_inner_size([360.0, 420.0])
-            .with_visible(false),
+            .with_inner_size([420.0, 500.0])
+            .with_visible(true),
         ..Default::default()
     };
     eframe::run_native(

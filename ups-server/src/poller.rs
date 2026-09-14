@@ -16,6 +16,36 @@ use crate::state::{self, SharedState};
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Apply the global "simulate on battery" override (toggled from the GUI).
+/// Replaces the real reading with an on-battery status that drains over
+/// time so clients' low-battery thresholds eventually trip.
+fn apply_simulation(state: &SharedState, mut s: ups_common::UpsStatus) -> ups_common::UpsStatus {
+    if !state::simulate_on_battery() {
+        return s;
+    }
+    // Drain from the previously stored (simulated) value so the gauge
+    // actually falls over successive polls instead of re-reading the real
+    // battery every time.
+    let (prev_pct, prev_runtime) = state
+        .read()
+        .ok()
+        .and_then(|m| m.get(&s.id).map(|p| (p.battery_pct, p.runtime_secs)))
+        .unwrap_or((None, None));
+    let pct = prev_pct
+        .filter(|p| *p > 5)
+        .map(|p| p.saturating_sub(1))
+        .unwrap_or(100);
+    let runtime = prev_runtime
+        .filter(|r| *r > 300)
+        .map(|r| r.saturating_sub(60))
+        .unwrap_or(1800);
+    s.status = ups_common::PowerState::OnBattery;
+    s.battery_pct = Some(pct.max(5));
+    s.runtime_secs = Some(runtime.max(300));
+    s.last_updated = chrono::Utc::now();
+    s
+}
+
 /// Spawn a polling task per configured UPS in real (HID) mode.
 pub fn spawn_real_pollers(state: SharedState, ups: Vec<UpsEntry>) {
     for entry in ups {
@@ -48,7 +78,7 @@ fn poll_one_real(state: SharedState, entry: UpsEntry) {
                 ups_common::UpsStatus::unknown(&entry.id)
             }
         };
-        state::update(&state, status);
+        state::update(&state, apply_simulation(&state, status));
         std::thread::sleep(POLL_INTERVAL);
     }
 }
