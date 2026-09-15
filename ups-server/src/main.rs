@@ -1,3 +1,7 @@
+// Windowed subsystem: no console window when double-clicked or launched at
+// login. Diagnostics still go to the log file and the in-app console.
+#![windows_subsystem = "windows"]
+
 mod api;
 mod config;
 mod gui;

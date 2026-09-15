@@ -9,6 +9,15 @@
 //!   0x8500DB Charging           -> battery charging
 //!   0x850066 RemainingCapacity  -> battery %
 //!   0x850068 RunTimeToEmpty     -> runtime seconds (while discharging)
+//!   0x840035 PercentLoad        -> output load %
+//!   0x840030 Voltage            -> output voltage (volts)
+//!
+//! PercentLoad and Voltage are read the same way as RemainingCapacity: taken
+//! as direct, unscaled values (APC's descriptors report them straight in %
+//! and volts, no Unit Exponent). Not every unit exposes these — `read_status`
+//! leaves them `None` when the usage isn't found, same as the other optional
+//! fields. Verify against a real descriptor with `ups-probe` if a unit's
+//! numbers look off by a factor of ten.
 //!
 //! Everything that touches hardware is isolated behind `read_status`; the
 //! parsing of raw descriptors and report payloads is pure and unit-tested.
@@ -34,6 +43,8 @@ const USAGE_AC_PRESENT: u32 = (BATTERY_USAGE_PAGE as u32) << 16 | 0xD0;
 const USAGE_DISCHARGING: u32 = (BATTERY_USAGE_PAGE as u32) << 16 | 0xD6;
 const USAGE_REMAINING_CAPACITY: u32 = (BATTERY_USAGE_PAGE as u32) << 16 | 0x66;
 const USAGE_RUNTIME_TO_EMPTY: u32 = (BATTERY_USAGE_PAGE as u32) << 16 | 0x68;
+const USAGE_PERCENT_LOAD: u32 = (UPS_USAGE_PAGE as u32) << 16 | 0x35;
+const USAGE_VOLTAGE: u32 = (UPS_USAGE_PAGE as u32) << 16 | 0x30;
 
 /// A discovered UPS device (not yet opened).
 #[derive(Debug, Clone)]
@@ -80,6 +91,8 @@ struct Located {
     discharging: Option<(u8, FieldLoc)>,
     remaining_capacity: Option<(u8, FieldLoc)>,
     runtime_to_empty: Option<(u8, FieldLoc)>,
+    percent_load: Option<(u8, FieldLoc)>,
+    voltage: Option<(u8, FieldLoc)>,
 }
 
 fn locate(layouts: &[ReportLayout]) -> Located {
@@ -91,6 +104,8 @@ fn locate(layouts: &[ReportLayout]) -> Located {
                 u if u == USAGE_DISCHARGING => &mut out.discharging,
                 u if u == USAGE_REMAINING_CAPACITY => &mut out.remaining_capacity,
                 u if u == USAGE_RUNTIME_TO_EMPTY => &mut out.runtime_to_empty,
+                u if u == USAGE_PERCENT_LOAD => &mut out.percent_load,
+                u if u == USAGE_VOLTAGE => &mut out.voltage,
                 _ => continue,
             };
             if slot.is_none() {
@@ -142,11 +157,29 @@ pub fn read_status(dev: &HidDevice, id: &str) -> Result<UpsStatus> {
         .and_then(|(rid, loc)| read_feature(dev, rid).and_then(|p| hid_desc::extract(&p, &loc)))
         .map(|v| v as u32);
 
+    let load_pct = located
+        .percent_load
+        .and_then(|(rid, loc)| read_feature(dev, rid).and_then(|p| hid_desc::extract(&p, &loc)))
+        .map(|v| v.min(100) as u8);
+
+    // Some APC firmwares leave a stray Unit/Unit Exponent from an unrelated
+    // preceding field applied to Voltage, producing values wildly outside
+    // any real mains range (observed: 5450 on a Smart-UPS 3000). Rather than
+    // guess a scale factor without hardware to calibrate against, drop
+    // readings outside a plausible mains-voltage band and surface `None`.
+    let voltage_v = located
+        .voltage
+        .and_then(|(rid, loc)| read_feature(dev, rid).and_then(|p| hid_desc::extract(&p, &loc)))
+        .map(|v| v as f32)
+        .filter(|v| (50.0..=500.0).contains(v));
+
     Ok(UpsStatus {
         id: id.to_string(),
         status,
         battery_pct,
         runtime_secs,
+        load_pct,
+        voltage_v,
         last_updated: Utc::now(),
     })
 }

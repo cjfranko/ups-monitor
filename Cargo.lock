@@ -4886,6 +4886,7 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "ups-common",
+ "windows 0.61.3",
  "winres",
 ]
 

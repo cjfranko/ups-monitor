@@ -94,6 +94,8 @@ mod tests {
             status: st,
             battery_pct: pct,
             runtime_secs: rt,
+            load_pct: None,
+            voltage_v: None,
             last_updated: Utc::now(),
         }
     }

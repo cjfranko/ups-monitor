@@ -23,6 +23,8 @@ pub struct MockUps {
     on_battery: bool,
     battery_pct: u8,
     runtime_secs: u32,
+    load_pct: u8,
+    voltage_v: f32,
 }
 
 impl MockUps {
@@ -32,6 +34,8 @@ impl MockUps {
             on_battery: failing,
             battery_pct: 100,
             runtime_secs: 3600,
+            load_pct: 35,
+            voltage_v: 230.0,
         }
     }
 
@@ -48,6 +52,9 @@ impl MockUps {
                 self.battery_pct = (self.battery_pct + 1).min(100);
             }
         }
+        // Load/voltage wander a little so the UI shows them changing.
+        self.load_pct = (self.load_pct as i16 + rng.gen_range(-2..=2)).clamp(5, 90) as u8;
+        self.voltage_v = (self.voltage_v + rng.gen_range(-1.0..=1.0)).clamp(215.0, 245.0);
         UpsStatus {
             id: self.id.clone(),
             status: if self.on_battery {
@@ -57,6 +64,8 @@ impl MockUps {
             },
             battery_pct: Some(self.battery_pct),
             runtime_secs: Some(self.runtime_secs),
+            load_pct: Some(self.load_pct),
+            voltage_v: Some(self.voltage_v),
             last_updated: Utc::now(),
         }
     }

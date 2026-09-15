@@ -28,6 +28,16 @@ image = { version = "0.25", default-features = false, features = ["ico"] }
 [target.'cfg(windows)'.dependencies]
 # Used to surface fatal startup errors from the windowed exe (no console).
 native-dialog = "0.7"
+# HidD_SetOutputReport: some UPS models (e.g. large Smart-UPS units) have no
+# interrupt OUT endpoint, so hidapi's generic write() can't send an Output
+# report — only the Windows HID control-transfer API can. Used by ups-probe
+# to query APC's legacy "smart protocol" ASCII tunnel.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Security",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds assets/icon.ico (if present) as the .exe's own icon.

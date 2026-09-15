@@ -35,6 +35,10 @@ pub struct UpsStatus {
     pub battery_pct: Option<u8>,
     /// Estimated runtime remaining, if the UPS reports it.
     pub runtime_secs: Option<u32>,
+    /// Output load as a percentage of rated capacity, if the UPS reports it.
+    pub load_pct: Option<u8>,
+    /// Output voltage in volts, if the UPS reports it.
+    pub voltage_v: Option<f32>,
     /// When this snapshot was produced/refreshed on the server.
     pub last_updated: DateTime<Utc>,
 }
@@ -46,6 +50,8 @@ impl UpsStatus {
             status: PowerState::Unknown,
             battery_pct: None,
             runtime_secs: None,
+            load_pct: None,
+            voltage_v: None,
             last_updated: Utc::now(),
         }
     }

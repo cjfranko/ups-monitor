@@ -478,6 +478,17 @@ fn ups_card(ui: &mut egui::Ui, s: &ups_common::UpsStatus) -> CardAction {
                         .map(|r| format!("{} min", r / 60))
                         .unwrap_or_else(|| "—".to_string());
                     ui.label(format!("Battery: {battery}   Runtime: {runtime}"));
+                    if s.load_pct.is_some() || s.voltage_v.is_some() {
+                        let load = s
+                            .load_pct
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "—".to_string());
+                        let voltage = s
+                            .voltage_v
+                            .map(|v| format!("{v:.0} V"))
+                            .unwrap_or_else(|| "—".to_string());
+                        ui.label(format!("Load: {load}   Voltage: {voltage}"));
+                    }
                     ui.small(format!("Updated {}", s.last_updated.format("%H:%M:%S")));
                 });
             });
