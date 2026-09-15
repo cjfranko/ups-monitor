@@ -14,6 +14,7 @@ use ups_common::PowerState;
 
 use crate::config::{Config, UpsEntry};
 use crate::hid::{self, DiscoveredUps};
+use crate::logbuf;
 use crate::poller::{self, PollerHandles};
 use crate::state::{self, SharedState};
 
@@ -140,6 +141,7 @@ impl TrayIcons {
 
 enum GuiCmd {
     Show,
+    ToggleConsole,
 }
 
 /// State for the "Add UPS" dialog: a USB scan result plus one id text-edit
@@ -174,6 +176,7 @@ pub struct StatusApp {
     add_dialog: AddDialog,
     rename_dialog: Option<RenameDialog>,
     delete_target: Option<String>,
+    show_console: bool,
 }
 
 impl StatusApp {
@@ -185,8 +188,10 @@ impl StatusApp {
 
         let menu = Menu::new();
         let show = MenuItem::new("Show status", true, None);
+        let console = MenuItem::new("Show Console", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let _ = menu.append(&show);
+        let _ = menu.append(&console);
         let _ = menu.append(&quit);
 
         let tray = TrayIconBuilder::new()
@@ -198,6 +203,7 @@ impl StatusApp {
 
         {
             let show_id = show.id().clone();
+            let console_id = console.id().clone();
             let quit_id = quit.id().clone();
             // Drive the viewport straight from the tray thread: when the
             // window is hidden, update() may not tick, so the mpsc command
@@ -211,6 +217,11 @@ impl StatusApp {
                         egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         egui_ctx.request_repaint();
                         let _ = tx.send(GuiCmd::Show);
+                    } else if event.id == console_id {
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        egui_ctx.request_repaint();
+                        let _ = tx.send(GuiCmd::ToggleConsole);
                     } else if event.id == quit_id {
                         // Exit straight from the tray thread — going through
                         // the GUI update loop can hang after CancelClose.
@@ -240,6 +251,7 @@ impl StatusApp {
             add_dialog: AddDialog::default(),
             rename_dialog: None,
             delete_target: None,
+            show_console: false,
         }
     }
 
@@ -481,20 +493,37 @@ impl eframe::App for StatusApp {
                 GuiCmd::Show => {
                     self.visible = true;
                     self.close_handled = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                GuiCmd::ToggleConsole => {
+                    self.visible = true;
+                    self.close_handled = false;
+                    self.show_console = !self.show_console;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
         }
 
-        // Close button hides to tray rather than quitting. Only cancel the
+        // Close button minimizes to tray rather than quitting. Minimize
+        // rather than hide: eframe/winit stop delivering redraw events to a
+        // truly hidden window on Windows, which means a later
+        // `Visible(true)` is never actually processed and the window can
+        // never come back — minimizing doesn't have that problem, and the
+        // taskbar entry is suppressed via `with_taskbar(false)` at window
+        // creation so this still reads as "closed to tray". Only cancel the
         // close once — re-cancelling every frame while the request is still
         // pending interferes with rendering.
         if ctx.input(|i| i.viewport().close_requested()) && self.visible && !self.close_handled {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.visible = false;
             self.close_handled = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Also close any floating sub-window (Console, Add UPS, etc.) —
+            // leaving one "open" while the main viewport is minimized left
+            // the window unable to come back when reopened from the tray.
+            self.show_console = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
 
         let statuses = state::snapshot(&self.state);
@@ -695,6 +724,26 @@ impl eframe::App for StatusApp {
             }
         }
 
+        // In-app "Console" — a real OS console can't be closed safely (see
+        // `logbuf.rs`), so this shows the same log lines in a window we
+        // fully control instead.
+        if self.show_console {
+            egui::Window::new("Console")
+                .open(&mut self.show_console)
+                .default_size([560.0, 360.0])
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.style_mut().override_font_id =
+                                Some(egui::FontId::monospace(12.0));
+                            for line in logbuf::snapshot() {
+                                ui.label(line);
+                            }
+                        });
+                });
+        }
+
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 
@@ -709,7 +758,11 @@ pub fn run(ctx: GuiContext) -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("UPS Monitor — Server")
         .with_inner_size([420.0, 500.0])
-        .with_visible(true);
+        .with_visible(true)
+        // The tray icon is this app's persistent presence; a taskbar entry
+        // would be redundant, and minimizing-to-tray (see `update`) would
+        // otherwise leave a "minimized" entry sitting in the taskbar.
+        .with_taskbar(false);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
     }

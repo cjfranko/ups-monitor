@@ -14,6 +14,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 notify-rust = "4"
 tray-icon = "0.19"
 eframe = "0.29"
@@ -24,6 +25,8 @@ image = { version = "0.25", default-features = false, features = ["ico"] }
 
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7"
+# Surfaces fatal startup errors and panics from the windowed exe (no console).
+native-dialog = "0.7"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Com",

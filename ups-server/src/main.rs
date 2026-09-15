@@ -3,6 +3,7 @@ mod config;
 mod gui;
 mod hid;
 mod hid_desc;
+mod logbuf;
 mod mock;
 mod poller;
 mod state;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tracing::{error, info, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 /// Show a fatal error to the user. This is a windowed exe (no console), so
 /// without a message box a startup failure looks like an instant, silent
@@ -48,8 +50,9 @@ fn log_path() -> std::path::PathBuf {
 }
 
 fn run() -> Result<()> {
-    // Log to a file next to the exe so failures are diagnosable on machines
-    // without a console (this is a windowed exe).
+    // Log to a file next to the exe, and also into an in-memory ring buffer
+    // that the tray's "Show console" item displays in an in-app window —
+    // this is a windowed exe with no real console to write to.
     let log_dir = log_path()
         .parent()
         .map(|p| p.to_path_buf())
@@ -60,7 +63,7 @@ fn run() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
-        .with_writer(file_appender)
+        .with_writer(file_appender.and(logbuf::BufferWriter))
         .with_ansi(false)
         .init();
 
